@@ -896,6 +896,19 @@ static int fpc1020_probe(struct platform_device *pdev)
 	}
 #endif
 
+#ifdef CONFIG_TOUCHSCREEN_COMMON
+	fpc1020->input_handler.filter = input_filter;
+	fpc1020->input_handler.connect = input_connect;
+	fpc1020->input_handler.disconnect = input_disconnect;
+	fpc1020->input_handler.name = FPC1020_NAME;
+	fpc1020->input_handler.id_table = ids;
+	rc = input_register_handler(&fpc1020->input_handler);
+	if (rc) {
+		dev_err(dev, "failed to register key handler\n");
+		goto exit;
+	}
+#endif
+
 	rc = sysfs_create_group(&dev->kobj, &attribute_group);
 	if (rc) {
 		dev_err(dev, "could not create sysfs\n");
