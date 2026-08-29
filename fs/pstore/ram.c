@@ -703,6 +703,7 @@ static int ramoops_parse_dt(struct platform_device *pdev,
 {
 	struct device_node *of_node = pdev->dev.of_node;
 	struct resource *res;
+	struct resource tmp_res;
 	u32 value;
 	int ret;
 
@@ -710,9 +711,27 @@ static int ramoops_parse_dt(struct platform_device *pdev,
 
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	if (!res) {
-		dev_err(&pdev->dev,
-			"failed to locate DT /reserved-memory resource\n");
-		return -EINVAL;
+		struct device_node *mem_node = of_parse_phandle(of_node, "memory-region", 0);
+		if (!mem_node)
+			mem_node = of_node;
+		if (of_address_to_resource(mem_node, 0, &tmp_res) == 0) {
+			res = &tmp_res;
+		} else {
+			const __be32 *prop;
+			int len;
+			prop = of_get_property(mem_node, "reg", &len);
+			if (prop && len >= 16) {
+				memset(&tmp_res, 0, sizeof(tmp_res));
+				tmp_res.start = of_read_number(prop, 2);
+				tmp_res.end = tmp_res.start + of_read_number(prop + 2, 2) - 1;
+				tmp_res.flags = IORESOURCE_MEM;
+				res = &tmp_res;
+			} else {
+				dev_err(&pdev->dev,
+					"failed to locate DT /reserved-memory resource\n");
+				return -EINVAL;
+			}
+		}
 	}
 
 	pdata->mem_size = resource_size(res);
