@@ -37,13 +37,13 @@
 #include <linux/fb.h>
 #endif
 #include <linux/debugfs.h>
+#include <linux/pm_wakeup.h>
 
 #include "nt36xxx.h"
 #if NVT_TOUCH_ESD_PROTECT
 #include <linux/jiffies.h>
 #endif /* #if NVT_TOUCH_ESD_PROTECT */
 #ifdef CONFIG_FB
-extern void mdss_panel_reset_skip_enable(bool enable);
 extern bool mdss_panel_is_prim(void *fbinfo);
 #endif
 
@@ -115,19 +115,19 @@ const uint16_t touch_key_array[TOUCH_KEY_NUM] = {
 
 #if WAKEUP_GESTURE
 const uint16_t gesture_key_array[] = {
-	KEY_POWER,  /*GESTURE_WORD_C*/
-	KEY_POWER,  /*GESTURE_WORD_W*/
-	KEY_POWER,  /*GESTURE_WORD_V*/
-	KEY_WAKEUP,  /*GESTURE_DOUBLE_CLICK*/
-	KEY_POWER,  /*GESTURE_WORD_Z*/
-	KEY_POWER,  /*GESTURE_WORD_M*/
-	KEY_POWER,  /*GESTURE_WORD_O*/
-	KEY_POWER,  /*GESTURE_WORD_e*/
-	KEY_POWER,  /*GESTURE_WORD_S*/
-	KEY_POWER,  /*GESTURE_SLIDE_UP*/
-	KEY_POWER,  /*GESTURE_SLIDE_DOWN*/
-	KEY_POWER,  /*GESTURE_SLIDE_LEFT*/
-	KEY_POWER,  /*GESTURE_SLIDE_RIGHT*/
+	KEY_WAKEUP,
+	KEY_WAKEUP,
+	KEY_WAKEUP,
+	KEY_WAKEUP,
+	KEY_WAKEUP,
+	KEY_WAKEUP,
+	KEY_WAKEUP,
+	KEY_WAKEUP,
+	KEY_WAKEUP,
+	KEY_WAKEUP,
+	KEY_WAKEUP,
+	KEY_WAKEUP,
+	KEY_WAKEUP,
 };
 
 #ifdef CONFIG_TOUCHSCREEN_COMMON
@@ -818,9 +818,6 @@ static int nvt_parse_dt(struct device *dev)
 	NVT_LOG("novatek,irq-gpio=%d\n", ts->irq_gpio);
 	ts->reset_gpio = of_get_named_gpio_flags(np, "novatek,reset-gpio", 0, NULL);
 	NVT_LOG("novatek,reset-gpio=%d\n", ts->reset_gpio);
-	ts->tddi_tp_hw_reset = of_property_read_bool(np, "novatek,tddi-tp-hw-reset");
-	ts->reset_tddi = of_get_named_gpio_flags(np, "novatek,reset-tddi", 0, NULL);
-	NVT_LOG("novatek,reset-tddi=%d\n", ts->reset_tddi);
 	retval = of_property_read_string(np, "novatek,vddio-reg-name", &name);
 
 	if (retval == -EINVAL)
@@ -1028,7 +1025,7 @@ regulator_put:
 	return retval;
 }
 
-static int nvt_enable_reg(struct nvt_ts_data *ts, bool enable)
+static int __maybe_unused nvt_enable_reg(struct nvt_ts_data *ts, bool enable)
 {
 	int retval;
 
@@ -1392,9 +1389,13 @@ return:
 *******************************************************/
 static irqreturn_t nvt_ts_irq_handler(int32_t irq, void *dev_id)
 {
+#if WAKEUP_GESTURE
 	if (bTouchIsAwake == 0) {
+		if (ts->gesture_wakeup)
+			__pm_wakeup_event(ts->gesture_wakeup, msecs_to_jiffies(3000));
 		dev_dbg(&ts->client->dev, "%s gesture wakeup\n", __func__);
 	}
+#endif
 	nvt_ts_work_func();
 
 	return IRQ_HANDLED;
@@ -1959,6 +1960,7 @@ static int32_t nvt_ts_probe(struct i2c_client *client, const struct i2c_device_i
 				__func__, ret);
 	}
 #endif
+	ts->gesture_wakeup = wakeup_source_register(NULL, "nvt-gesture-wake");
 #endif
 	snprintf(ts->phys, strlen("input/ts"), "input/ts");
 	ts->input_dev->name = NVT_TS_NAME;
@@ -2010,6 +2012,7 @@ static int32_t nvt_ts_probe(struct i2c_client *client, const struct i2c_device_i
 
 	ts->dbclick_count = 0;
 	device_init_wakeup(&client->dev, 1);
+	ts->irq_wake_enabled = false;
 	ts->dev_pm_suspend = false;
 	init_completion(&ts->dev_pm_suspend_completion);
 #if BOOT_UPDATE_FIRMWARE_INWORK
@@ -2166,6 +2169,10 @@ err_create_nvt_fwu_wq_failed:
 #endif
 err_int_request_failed:
 err_input_register_device_failed:
+#if WAKEUP_GESTURE
+	if (ts->gesture_wakeup)
+		wakeup_source_unregister(ts->gesture_wakeup);
+#endif
 	input_free_device(ts->input_dev);
 err_input_dev_alloc_failed:
 err_create_nvt_wq_failed:
@@ -2217,6 +2224,11 @@ static int32_t nvt_ts_remove(struct i2c_client *client)
 #endif
 	destroy_workqueue(ts->event_wq);
 
+#if WAKEUP_GESTURE
+	if (ts->gesture_wakeup)
+		wakeup_source_unregister(ts->gesture_wakeup);
+#endif
+
 	nvt_get_reg(ts, false);
 	/*nvt_enable_reg(ts, false);*/
 	mutex_destroy(&ts->lock);
@@ -2267,6 +2279,10 @@ static int32_t nvt_ts_suspend(struct device *dev)
 #else
 		CTP_I2C_WRITE(ts->client, I2C_FW_Address, buf, 2);
 #endif
+		if (!ts->irq_wake_enabled) {
+			enable_irq_wake(ts->client->irq);
+			ts->irq_wake_enabled = true;
+		}
 		NVT_LOG("Enabled touch wakeup gesture\n");
 	} else {
 		disable_irq_nosync(ts->client->irq);
@@ -2335,19 +2351,22 @@ static int32_t nvt_ts_resume(struct device *dev)
 	if (ts->fw_ver == 0)
 		nvt_get_fw_info();
 
-	if ((ts->gesture_enabled && ts->gesture_disabled_when_resume) || !ts->gesture_enabled_when_resume) {
+	if (ts->irq_wake_enabled) {
+		disable_irq_wake(ts->client->irq);
+		ts->irq_wake_enabled = false;
+	} else {
 		enable_irq(ts->client->irq);
+	}
 
-		if (ts->ts_pinctrl) {
-			ret = pinctrl_select_state(ts->ts_pinctrl, ts->pinctrl_state_active);
+	if (ts->ts_pinctrl) {
+		ret = pinctrl_select_state(ts->ts_pinctrl, ts->pinctrl_state_active);
 
-			if (ret < 0) {
-				NVT_ERR("Failed to select %s pinstate %d\n",
-					PINCTRL_STATE_ACTIVE, ret);
-			}
-		} else {
-			NVT_ERR("Failed to init pinctrl\n");
+		if (ret < 0) {
+			NVT_ERR("Failed to select %s pinstate %d\n",
+				PINCTRL_STATE_ACTIVE, ret);
 		}
+	} else {
+		NVT_ERR("Failed to init pinctrl\n");
 	}
 
 #if NVT_TOUCH_ESD_PROTECT
@@ -2364,8 +2383,6 @@ static void nvt_resume_work(struct work_struct *work)
 	struct nvt_ts_data *ts =
 			container_of(work, struct nvt_ts_data, resume_work);
 	nvt_ts_resume(&ts->client->dev);
-	ts->gesture_enabled_when_resume = false;
-	ts->gesture_disabled_when_resume = true;
 }
 
 #if defined(CONFIG_DRM)
@@ -2380,49 +2397,19 @@ static int drm_notifier_callback(struct notifier_block *self, unsigned long even
 		blank = evdata->data;
 
 		if (*blank == DRM_BLANK_POWERDOWN) {
-			if (ts->gesture_enabled) {
-				nvt_enable_reg(ts, true);
-				drm_panel_reset_skip_enable(true);
-				/*drm_dsi_ulps_enable(true);*/
-				/*drm_dsi_ulps_suspend_enable(true);*/
-			}
+			flush_workqueue(ts->event_wq);
 			nvt_ts_suspend(&ts->client->dev);
-			if (ts->tddi_tp_hw_reset && !ts->gesture_enabled) {
-				NVT_ERR("set tp reset low\n");
-				gpio_direction_output(ts->reset_gpio, 0);
-			}
-
 #ifdef NVT_TOUCH_COUNT_DUMP
 			sysfs_notify(&ts->nvt_touch_dev->kobj, NULL,
 				     "touch_suspend_notify");
 #endif
-		} else if (*blank == DRM_BLANK_UNBLANK) {
-			if (ts->gesture_enabled) {
-				if (ts->tddi_tp_hw_reset)
-					gpio_direction_output(ts->reset_gpio, 0);
-				gpio_direction_output(ts->reset_tddi, 0);
-				msleep(15);
-				gpio_direction_output(ts->reset_tddi, 1);
-				if (ts->tddi_tp_hw_reset)
-					gpio_direction_output(ts->reset_gpio, 1);
-				msleep(20);
-			}
 		}
 	} else if (evdata && evdata->data && event == DRM_EVENT_BLANK) {
 		blank = evdata->data;
 
 		if (*blank == DRM_BLANK_UNBLANK) {
-			if (ts->gesture_enabled) {
-				drm_panel_reset_skip_enable(false);
-				/*drm_dsi_ulps_enable(false);*/
-				/*drm_dsi_ulps_suspend_enable(false);*/
-				nvt_enable_reg(ts, false);
-			}
-			if (ts->tddi_tp_hw_reset && !ts->gesture_enabled) {
-				NVT_ERR("set tp reset high\n");
-				gpio_direction_output(ts->reset_gpio, 1);
-			}
-			nvt_ts_resume(&ts->client->dev);
+			flush_workqueue(ts->event_wq);
+			queue_work(ts->event_wq, &ts->resume_work);
 #ifdef NVT_TOUCH_COUNT_DUMP
 			sysfs_notify(&ts->nvt_touch_dev->kobj, NULL,
 				     "touch_suspend_notify");
@@ -2446,48 +2433,14 @@ static int fb_notifier_callback(struct notifier_block *self, unsigned long event
 		if (event == FB_EARLY_EVENT_BLANK) {
 			if (*blank == FB_BLANK_POWERDOWN) {
 				flush_workqueue(ts->event_wq);
-				if (ts->gesture_enabled) {
-					nvt_enable_reg(ts, true);
-					ts->gesture_enabled_when_resume = true;
-					ts->gesture_disabled_when_resume = false;
-					mdss_panel_reset_skip_enable(true);
-					/*drm_dsi_ulps_enable(true);*/
-					/*drm_dsi_ulps_suspend_enable(true);*/
-				}
 				nvt_ts_suspend(&ts->client->dev);
-				if (ts->tddi_tp_hw_reset && !ts->gesture_enabled) {
-					NVT_ERR("set tp reset low\n");
-					gpio_direction_output(ts->reset_gpio, 0);
-				}
 #ifdef NVT_TOUCH_COUNT_DUMP
 				sysfs_notify(&ts->nvt_touch_dev->kobj, NULL,
 						 "touch_suspend_notify");
 #endif
-			} else if (*blank == FB_BLANK_UNBLANK) {
-				if ((ts->gesture_enabled || !ts->gesture_disabled_when_resume) && ts->gesture_enabled_when_resume) {
-					if (ts->tddi_tp_hw_reset)
-						gpio_direction_output(ts->reset_gpio, 0);
-					gpio_direction_output(ts->reset_tddi, 0);
-					msleep(15);
-					gpio_direction_output(ts->reset_tddi, 1);
-					if (ts->tddi_tp_hw_reset)
-						gpio_direction_output(ts->reset_gpio, 1);
-					msleep(20);
-				}
 			}
 		} else if (event == FB_EVENT_BLANK) {
 			if (*blank == FB_BLANK_UNBLANK) {
-				if ((ts->gesture_enabled || !ts->gesture_disabled_when_resume) && ts->gesture_enabled_when_resume) {
-					mdss_panel_reset_skip_enable(false);
-					/*drm_dsi_ulps_enable(false);*/
-					/*drm_dsi_ulps_suspend_enable(false);*/
-					nvt_enable_reg(ts, false);
-				}
-				if (ts->tddi_tp_hw_reset && !ts->gesture_enabled) {
-					NVT_ERR("set tp reset high\n");
-					gpio_direction_output(ts->reset_gpio, 1);
-				}
-
 				flush_workqueue(ts->event_wq);
 				queue_work(ts->event_wq, &ts->resume_work);
 #ifdef NVT_TOUCH_COUNT_DUMP
@@ -2548,23 +2501,14 @@ static struct i2c_board_info __initdata nvt_i2c_boardinfo[] = {
 #ifdef CONFIG_PM
 static int nvt_pm_suspend(struct device *dev)
 {
-	if (device_may_wakeup(dev) && ts->gesture_enabled) {
-		NVT_LOG("enable touch irq wake\n");
-		enable_irq_wake(ts->client->irq);
-	}
 	ts->dev_pm_suspend = true;
 	reinit_completion(&ts->dev_pm_suspend_completion);
 
 	return 0;
-
 }
 
 static int nvt_pm_resume(struct device *dev)
 {
-	if (device_may_wakeup(dev) && ts->gesture_enabled) {
-		NVT_LOG("disable touch irq wake\n");
-		disable_irq_wake(ts->client->irq);
-	}
 	ts->dev_pm_suspend = false;
 	complete(&ts->dev_pm_suspend_completion);
 

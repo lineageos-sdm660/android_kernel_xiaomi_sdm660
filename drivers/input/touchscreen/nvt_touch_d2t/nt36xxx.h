@@ -144,7 +144,6 @@ struct nvt_ts_data {
 	uint32_t irq_flags;
 	int32_t reset_gpio;
 	uint32_t reset_flags;
-	int32_t reset_tddi;
 	struct mutex lock;
 	struct mutex mdata_lock;
 	const struct nvt_ts_mem_map *mmap;
@@ -170,9 +169,10 @@ struct nvt_ts_data {
 	bool dump_click_count;
 	char *current_clicknum_file;
 #endif
-	bool tddi_tp_hw_reset;
-	bool gesture_enabled_when_resume;
-	bool gesture_disabled_when_resume;
+	bool irq_wake_enabled;
+#if WAKEUP_GESTURE
+	struct wakeup_source *gesture_wakeup;
+#endif
 };
 
 struct nvt_mode_switch {
